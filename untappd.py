@@ -2,226 +2,156 @@
 
 from curses import has_key
 import requests
-import csv
-import brotli
-import json
 import re
-import sys
+import requests_random_user_agent
 import time
 import urllib.parse
 from time import sleep
 
 from bs4 import BeautifulSoup
 
-hdr = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/103.0.0.0 Safari/537.36',
-    'Accept' : 'application/json, text/plain, */*, application/x-www-form-urlencoded',
-    'Accept-Charset': 'ISO-8859-1,utf-8;q=0.7,*;q=0.3',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Accept-Language': 'en-US,en;q=0.8',
-    'Connection': 'keep-alive',
-    'Cache-Control' : 'max-age=0'
-}
+class Untappd:
 
-untappdUrl = 'https://untappd.com/user/unzsuzsual/beers?q=Bloomin&sort=date'
-'https://untappd.com/user/unzsuzsual/beers?q=Golden%20Road%20Brewing&sort=date'
-
-csvHdr = [
-    'name',
-    'brand',
-    'style',
-    'abv',
-    'ibu',
-    'containerType',
-    'price',
-    'stock',
-    'averageRating',
-    'numberOfReviews',
-    'zHasHad',
-    'zRating',
-]
-
-def getAbvIbu(beer):
-    name = beer['name']
-    brewery = beer['brand']['name']
-    if len(beer['categories']) < 4:
-        style = 'None'
-    else:
-        style = beer['categories'][3]['name']
-
-    untappdUrl = 'https://untappd.com/search?' + \
-        urllib.parse.urlencode({'q' : name}, quote_via=urllib.parse.quote)
-
-    req = requests.post(untappdUrl, headers=hdr)
-    if req.status_code != 200:
-        print('Failed to find beer {}, status = {}'.format(name, req.status_code))
-        return
-
-    # Status code is okay, but that doesn't mean we found matching beers
-    # Now we parse the available list of beers
-    soup = BeautifulSoup(req.text, 'html.parser')
-    foundBeers = soup.find_all(class_='beer-item')
-    matches = [None] * len(foundBeers)
-    bestScore = 0
-    bestBeer = None
-
-    # print('DEBUG: Matched {} beers!'.format(len(foundBeers)))
-
-    for idx in range(0, len(foundBeers), 1):
-        found = foundBeers[idx]
-
-        foundName = found.find(class_='name').getText()
-        foundBrewery = found.find(class_='brewery').getText()
-        foundStyle = found.find(class_='style').getText()
-        
-        # print('DEBUG: Name = {}, Brand = {}, Style = {}'.format(foundName, foundBrewery, foundStyle))
-
-        score = 0
-        if re.match(name, foundName) != None or re.match(foundName, name) != None:
-            score = score + 1
-        if re.match(style, foundStyle) != None or re.match(foundStyle, style) != None:
-            score = score + 1
-        if re.match(brewery, foundBrewery) != None or re.match(foundBrewery, brewery) != None:
-            score = score + 1
-
-        if score >= bestScore:
-            bestScore = score
-            bestBeer = found
-
-        matches[idx] = [foundName, score]
-
-    for match in matches:
-        print('DEBUG: Beer {} score = {}'.format(match[0], match[1]))
-
-    if bestBeer == None:
-        results = {'abv' : 'None', 'ibu' : 'None'}
-    else:
-        abv = bestBeer.find(class_='abv').getText().strip()
+    def __getAbv(self, beer):
+        abv = beer.find(class_='abv').getText().strip()
         m = re.match('(.*)% ABV', abv)
         if m == None:
-            abv = 'N/A'
+            abv = -1
         else:
             abv = m.group(1)
-        ibu = bestBeer.find(class_='ibu').getText().strip()
-        m = re.match('(.*)% IBU', ibu)
+
+        if abv == "N/A":
+            abv = -1
+        return abv
+
+    def __getIbu(self, beer):
+        ibu = beer.find(class_='ibu').getText().strip()
+        m = re.match('(.*) IBU', ibu)
         if m == None:
-            ibu = 'N/A'
+            ibu = -1
         else:
             ibu = m.group(1)
         
-        results = {
-            'abv' : abv,
-            'ibu' : ibu
+        if ibu == "N/A":
+            ibu = -1
+        return ibu
+
+    def __createUntappdUrl(self, beerName, breweryName, userName=None):
+        if userName == None:
+            return 'https://untappd.com/search?' + \
+                urllib.parse.urlencode(
+                    {'q' : '{} {}'.format(breweryName, beerName)},
+                    quote_via=urllib.parse.quote
+                )
+        else:
+            return 'https://untappd.com/' \
+                + f'user/{userName}/' \
+                + 'beers?' \
+                + urllib.parse.urlencode({'q' : '{} {}'.format(breweryName, beerName)}, quote_via=urllib.parse.quote) \
+                + '&sort=date'
+
+    def __retrieveURLData(self, url):
+        req = None
+        while(1):
+            try:
+                req = requests.post(url, headers={'Cache-Control' : 'no-cache'})
+            except:
+                print('Exception from Untappd. Sleeping until retry...')
+                time.sleep(10)
+                continue
+
+            if req.status_code == 429:
+                print(f'Untappd requested back off for {req.headers["Retry-After"]} seconds.')
+                time.sleep(int(req.headers['Retry-After']))
+                continue
+            elif req.status_code != 200:
+                print('Failed to find beer, status = {}'.format(req.status_code))
+                return None
+            break
+        return req
+
+    def __findBeer(self, beerName, breweryName, style):
+        untappdUrl = self.__createUntappdUrl(beerName, breweryName)
+        req = self.__retrieveURLData(untappdUrl)
+        if req == None:
+            return None
+
+        # Status code is okay, but that doesn't mean we found matching beers
+        # Now we parse the available list of beers
+        soup = BeautifulSoup(req.text, 'html.parser')
+        foundBeers = soup.find_all(class_='beer-item')
+        if len(foundBeers) == 0:
+            return None
+        bestOption = {
+            'score' : 0,
+            'name' : None,
+            'brewery' : None,
+            'style' : None,
+            'abv' : None,
+            'ibu' : None,
+            'id' : None
         }
-    
-    return results
 
-def findUntappedBeer(beer):
-    name = beer['name']
-    brewery = beer['brand']['name']
-    if len(beer['categories']) < 4:
-        style = 'None'
-    else:
-        style = beer['categories'][3]['name']
+        for idx in range(0, len(foundBeers), 1):
+            found = foundBeers[idx]
 
-    untappdUrl = 'https://untappd.com/user/unzsuzsual/beers?' + \
-        urllib.parse.urlencode({'q' : name}, quote_via=urllib.parse.quote) + \
-        '&sort=date'
-    # print('URL={}'.format(untappdUrl))
-    req = requests.post(untappdUrl, headers=hdr)
-    if req.status_code != 200:
-        print('Failed to find beer {}, status = {}'.format(name, req.status_code))
-        return
-    
-    # Status code is okay, but that doesn't mean we found matching beers
-    # Now we parse the available list of beers
-    soup = BeautifulSoup(req.text, 'html.parser')
-    foundBeers = soup.find_all(class_='beer-item')
-    matches = [None] * len(foundBeers)
-    bestScore = 0
-    bestBeer = None
+            foundName = found.find(class_='name').getText()
+            foundBrewery = found.find(class_='brewery').getText()
+            foundStyle = found.find(class_='style').getText()
+            foundId = found.find(class_='label')['href'].rsplit('/', 1)[-1]
+            foundRating = found.find(attrs={'data-rating' : True})['data-rating']
 
-    # print('DEBUG: Matched {} beers!'.format(len(foundBeers)))
+            abv = self.__getAbv(found)
+            ibu = self.__getIbu(found)
 
-    for idx in range(0, len(foundBeers), 1):
-        found = foundBeers[idx]
+            score = 0
+            if  re.compile(re.escape(beerName)).search(foundName) != None or\
+                re.compile(re.escape(foundName)).search(beerName) != None:
+                score = score + 1
+            if  re.compile(re.escape(style)).search(foundStyle) != None or\
+                re.compile(re.escape(foundStyle)).search(style) != None:
+                score = score + 1
+            if  re.compile(re.escape(breweryName)).search(foundBrewery) != None or\
+                re.compile(re.escape(foundBrewery)).search(breweryName) != None:
+                score = score + 1
+            if abv != None:
+                score = score + 1
+            if ibu != None:
+                score = score + 1
 
-        foundName = found.find(class_='name').getText()
-        foundBrewery = found.find(class_='brewery').getText()
-        foundStyle = found.find(class_='style').getText()
+            if score > bestOption['score']:
+                bestOption['score'] = score
+                bestOption['name'] = foundName
+                bestOption['brewery'] = foundBrewery
+                bestOption['style'] = foundStyle
+                bestOption['abv'] = abv
+                bestOption['ibu'] = ibu
+                bestOption['id'] = foundId
+                bestOption['rating'] = foundRating
+
+        return bestOption
+
+    def searchForBeer(self, beerName, breweryName, style='None'):
+        beer = self.__findBeer(beerName, breweryName, style)
+        return beer
+
+    def userHasHadBeer(self, userName, beerName, breweryName, style='None', id=None):
+        beer = self.__findBeer(beerName, breweryName, style)
+        if beer == None:
+            return None
+
+        untappdUrl = self.__createUntappdUrl(beerName, breweryName, userName)
+        req = self.__retrieveURLData(untappdUrl)
+        if req == None:
+            return None
         
-        # print('DEBUG: Name = {}, Brand = {}, Style = {}'.format(foundName, foundBrewery, foundStyle))
+        soup = BeautifulSoup(req.text, 'html.parser')
+        foundBeers = soup.find_all(class_='beer-item', attrs={'data-bid': beer['id']})
+        beer['userHasHad'] = False
+        if len(foundBeers) != 0:
+            beer['userHasHad'] = True
+            userRating = foundBeers[0].find(attrs={'data-rating' : True})['data-rating']
+            beer['userRating'] = userRating
 
-        score = 0
-        if re.match(name, foundName) != None or re.match(foundName, name) != None:
-            score = score + 1
-        if re.match(style, foundStyle) != None or re.match(foundStyle, style) != None:
-            score = score + 1
-        if re.match(brewery, foundBrewery) != None or re.match(foundBrewery, brewery) != None:
-            score = score + 1
-
-        if score >= bestScore:
-            bestScore = score
-            bestBeer = found
-
-        matches[idx] = [foundName, score]
-
-    for match in matches:
-        print('DEBUG: Beer {} score = {}'.format(match[0], match[1]))
-
-    return False if bestBeer == None else True
-
-with open('sheet.csv', 'w') as out:
-    writer = csv.writer(out,
-        delimiter = ',',
-        quotechar = '"',
-        doublequote = True,
-        skipinitialspace = False,
-        lineterminator = '\r\n',
-        quoting = csv.QUOTE_MINIMAL)
-    writer.writerow(csvHdr)
-
-with open('beers.json', 'r', encoding='utf-8') as f:
-    beerList = json.load(f)
-    maxBeers = len(beerList['beers'])
-    beerNo = 0
-    for beer in beerList['beers']:
-        print('(({}/{}) Searching for beer {}'.format(beerNo, maxBeers, beer['name']))
-        beerNo = beerNo + 1
-        time.sleep(1)
-        zHasHad = findUntappedBeer(beer)
-        # input("DEBUG: Press ENTER when ready to resume...")
-        time.sleep(1)
-        info = getAbvIbu(beer)
-        if info == None:
-            continue
-
-        with open('sheet.csv', 'a') as out:
-            writer = csv.writer(out, delimiter = ',',
-                quotechar = '"',
-                doublequote = True,
-                skipinitialspace = False,
-                lineterminator = '\r\n',
-                quoting = csv.QUOTE_MINIMAL)
-
-            if len(beer['categories']) < 4:
-                style = 'None'
-            else:
-                style = beer['categories'][3]['name']
-
-            row = [
-                '{}'.format(beer['name']),
-                '{}'.format(beer['brand']['name']),
-                '{}'.format(style),
-                '{}'.format(info['abv']),
-                '{}'.format(info['ibu']),
-                '{}'.format(beer['containerType']),
-                '{}'.format(beer['price'][0]['price']),
-                '{}'.format(beer['stockLevel'][0]['stock']),
-                '{}'.format(beer['customerAverageRating']),
-                '{}'.format(beer['customerReviewsCount']),
-                '{}'.format(zHasHad),
-                '0'
-            ]
-            writer.writerow(row)
-            
+        beer['returnId'] = id
+        return beer
